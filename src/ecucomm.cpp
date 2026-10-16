@@ -1,5 +1,6 @@
 #include "ecucomm.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 
 serial::Serial ser;
@@ -30,7 +31,19 @@ namespace ecucomm
         }
         ROS_INFO("cmd_vel timeout: %.3f s.", cmd_vel_timeout_);
 
+        nh_private_.param<std::string>("joy_topic", joy_topic_, "joy");
+        nh_private_.param("estop_button", estop_button_, 11);
+        nh_private_.param("reset_button", reset_button_, 10);
+        if (estop_button_ < 0 || reset_button_ < 0 || estop_button_ == reset_button_)
+        {
+            ROS_WARN("Invalid joystick button indices; using estop=11, reset=10.");
+            estop_button_ = 11;
+            reset_button_ = 10;
+        }
+        ROS_INFO("Joystick control: topic=%s, estop_button=%d, reset_button=%d.", joy_topic_.c_str(), estop_button_, reset_button_);
+
         cmd_vel_sub_ = nh_.subscribe("cmd_vel", 1, &ecucomm::cmdVelCb, this);
+        joy_sub_ = nh_.subscribe(joy_topic_, 10, &ecucomm::joyCb, this);
         // 使用实际时间触发发送，仿真时间暂停时仍能检查超时并暂停发送。
         loop_timer_ = nh_.createWallTimer(ros::WallDuration(0.01), &ecucomm::timerCb, this);
     }
@@ -38,7 +51,7 @@ namespace ecucomm
     void ecucomm::timerCb(const ros::WallTimerEvent &)
     {
         // 尚未收到消息，或已经超时：保持静默，不发送串口指令。
-        if (!has_cmd_vel_)
+        if (emergency_stop_ || !has_cmd_vel_)
         {
             return;
         }
@@ -61,6 +74,12 @@ namespace ecucomm
 
     void ecucomm::cmdVelCb(const geometry_msgs::Twist::ConstPtr &msg)
     {
+        // 锁定期间丢弃速度消息，不更新指令或接收时间。
+        if (emergency_stop_)
+        {
+            return;
+        }
+
         last_cmd_vel_time_ = std::chrono::steady_clock::now();
         has_cmd_vel_ = true;
 
@@ -124,9 +143,65 @@ namespace ecucomm
                           peak_command > max_motor_command ? "yes" : "no");
     }
 
+    void ecucomm::joyCb(const sensor_msgs::Joy::ConstPtr &msg)
+    {
+        if (static_cast<std::size_t>(estop_button_) >= msg->buttons.size() ||
+            static_cast<std::size_t>(reset_button_) >= msg->buttons.size())
+        {
+            // 按键数据不完整时锁定发送，避免越界或错误解锁。
+            emergency_stop_ = true;
+            has_cmd_vel_ = false;
+            LeftWheel_speed = 0;
+            RightWheek_speed = 0;
+            joy_received_ = false;
+            reset_button_was_pressed_ = false;
+            ROS_WARN_THROTTLE(1.0,
+                              "Joy has only %zu buttons; estop=%d, reset=%d. Serial transmission locked.",
+                              msg->buttons.size(), estop_button_, reset_button_);
+            return;
+        }
+
+        const bool estop_pressed = msg->buttons[estop_button_] != 0;
+        const bool reset_pressed = msg->buttons[reset_button_] != 0;
+        // 首条有效消息只记录重置键状态，避免把初始按住状态误判为新的按键动作。
+        const bool reset_pressed_edge = joy_received_ && reset_pressed && !reset_button_was_pressed_;
+        joy_received_ = true;
+        reset_button_was_pressed_ = reset_pressed;
+
+        // 急停优先；两键同时按下，或一直按住重置键，都不能解除急停。
+        if (estop_pressed)
+        {
+            if (!emergency_stop_)
+            {
+                ROS_WARN("Joystick estop pressed; serial transmission locked.");
+            }
+            emergency_stop_ = true;
+        }
+        else if (reset_pressed_edge)
+        {
+            emergency_stop_ = false;
+            ROS_INFO("Joystick reset pressed; serial unlocked, waiting for a new cmd_vel.");
+        }
+        else
+        {
+            return;
+        }
+
+        // 急停和重置均清空旧指令；重置后需收到后续 cmd_vel 才恢复发送。
+        has_cmd_vel_ = false;
+        LeftWheel_speed = 0;
+        RightWheek_speed = 0;
+    }
+
     // 发送消息
     void ecucomm::sendmsgs()
     {
+        // 在唯一的串口发送入口拦截，急停期间连零指令也不发送。
+        if (emergency_stop_)
+        {
+            return;
+        }
+
         std::string left_str;
         left_str = std::to_string(LeftWheel_speed);
         int position = left_str.find_first_of(".");

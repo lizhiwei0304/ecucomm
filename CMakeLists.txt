@@ -5,6 +5,7 @@ set(catkin_deps
         roscpp
 		rospy
         geometry_msgs
+        sensor_msgs
     )
 
 find_package(catkin REQUIRED COMPONENTS
