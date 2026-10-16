@@ -1,7 +1,3 @@
-//
-// Created by lizhiwei on 20-06-18.
-//
-
 #ifndef ECUCOMM_HPP
 #define ECUCOMM_HPP
 #include <ros/ros.h>
@@ -31,6 +27,7 @@ namespace ecucomm
     void timerCb(const ros::WallTimerEvent &event);
     void cmdVelCb(const geometry_msgs::Twist::ConstPtr &msg);
     void joyCb(const sensor_msgs::Joy::ConstPtr &msg);
+    void setVelocity(double linear_velocity, double angular_velocity, const char *source);
     void sendmsgs();
     // 手柄按键下标从 0 开始；急停锁定后只有重置按键的新按下动作才能解锁。
     std::string joy_topic_ = "joy";
@@ -39,6 +36,11 @@ namespace ecucomm
     bool emergency_stop_ = false;
     bool joy_received_ = false;
     bool reset_button_was_pressed_ = false;
+    // buttons[0] 自动，buttons[1] 手动；上电及解锁后默认手动。
+    bool manual_mode_ = true;
+    bool auto_button_was_pressed_ = false;
+    bool manual_button_was_pressed_ = false;
+    bool joy_active_ = false;
     double LeftWheel_speed = 0;
     double RightWheek_speed = 0;
     // 超过此时长未收到 cmd_vel 就暂停发送，使用单调时钟计时，单位为秒。

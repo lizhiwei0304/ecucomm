@@ -1,0 +1,13 @@
+<launch>
+  <arg name="joy_dev" default="/dev/input/js0" />
+
+  <node pkg="joy" type="joy_node" name="joy_node" output="screen">
+    <param name="dev" value="$(arg joy_dev)" />
+    <!-- 持续发布，避免摇杆保持不动时触发底盘消息超时。 -->
+    <param name="autorepeat_rate" value="20.0" />
+    <!-- 死区由 ecucomm 处理，避免重复缩放。 -->
+    <param name="deadzone" value="0.0" />
+  </node>
+
+  <node pkg="ecucomm" type="ecucomm_node" name="ecucomm" output="screen" />
+</launch>

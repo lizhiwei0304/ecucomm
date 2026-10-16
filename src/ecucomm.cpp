@@ -6,6 +6,20 @@
 serial::Serial ser;
 namespace ecucomm
 {
+    namespace
+    {
+        double mapJoyAxis(double value)
+        {
+            const double deadzone = 0.1;
+            value = std::max(-1.0, std::min(1.0, value));
+            if (std::abs(value) <= deadzone)
+            {
+                return 0.0;
+            }
+            return std::copysign((std::abs(value) - deadzone) / (1.0 - deadzone), value);
+        }
+    }
+
     ecucomm::ecucomm(const ros::NodeHandle &nh, const ros::NodeHandle &nh_private, std::string node_name)
         : nh_(nh),
           nh_private_(nh_private),
@@ -41,6 +55,7 @@ namespace ecucomm
             reset_button_ = 10;
         }
         ROS_INFO("Joystick control: topic=%s, estop_button=%d, reset_button=%d.", joy_topic_.c_str(), estop_button_, reset_button_);
+        ROS_INFO("Control mode: MANUAL. buttons[0]=AUTO, buttons[1]=MANUAL.");
 
         cmd_vel_sub_ = nh_.subscribe("cmd_vel", 1, &ecucomm::cmdVelCb, this);
         joy_sub_ = nh_.subscribe(joy_topic_, 10, &ecucomm::joyCb, this);
@@ -62,9 +77,10 @@ namespace ecucomm
         if (elapsed >= cmd_vel_timeout_)
         {
             has_cmd_vel_ = false;
+            joy_active_ = false;
             LeftWheel_speed = 0;
             RightWheek_speed = 0;
-            ROS_WARN("No cmd_vel received for %.3f s; serial command transmission paused.", elapsed);
+            ROS_WARN("No velocity input received for %.3f s; serial command transmission paused.", elapsed);
             return;
         }
 
@@ -73,6 +89,16 @@ namespace ecucomm
     }
 
     void ecucomm::cmdVelCb(const geometry_msgs::Twist::ConstPtr &msg)
+    {
+        if (manual_mode_)
+        {
+            return;
+        }
+        setVelocity(msg->linear.x, -msg->angular.z, "cmd_vel");
+    }
+
+    // 两个速度来源共用差速换算；角速度在调用前完成方向校正。
+    void ecucomm::setVelocity(double linear_velocity, double angular_velocity, const char *source)
     {
         // 锁定期间丢弃速度消息，不更新指令或接收时间。
         if (emergency_stop_)
@@ -83,19 +109,17 @@ namespace ecucomm
         last_cmd_vel_time_ = std::chrono::steady_clock::now();
         has_cmd_vel_ = true;
 
-        const double linear_velocity = msg->linear.x;
-        const double angular_velocity = -msg->angular.z;
         if (!std::isfinite(linear_velocity) || !std::isfinite(angular_velocity))
         {
             ROS_WARN_THROTTLE(1.0,
-                              "Invalid cmd_vel: linear.x=%g, angular.z=%g; stopping both wheels.",
-                              linear_velocity, angular_velocity);
+                              "Invalid %s: linear.x=%g, angular.z=%g; stopping both wheels.",
+                              source, linear_velocity, angular_velocity);
             LeftWheel_speed = 0;
             RightWheek_speed = 0;
             return;
         }
 
-        // 差速底盘：正角速度为向左转，右轮比左轮快。
+        // 差速换算，输入角速度已经完成方向校正。
         const double leftv = linear_velocity - angular_velocity * wheel_separation_ / 2.0;
         const double rightv = linear_velocity + angular_velocity * wheel_separation_ / 2.0;
 
@@ -115,9 +139,9 @@ namespace ecucomm
         if (!std::isfinite(LeftWheel_speed) || !std::isfinite(RightWheek_speed))
         {
             ROS_WARN_THROTTLE(1.0,
-                              "cmd_vel exceeds the supported numeric range: linear.x=%g, angular.z=%g, "
+                              "%s exceeds the supported numeric range: linear.x=%g, angular.z=%g, "
                               "mixed_left=%g, mixed_right=%g; stopping both wheels.",
-                              linear_velocity, angular_velocity, mixed_left_command, mixed_right_command);
+                              source, linear_velocity, angular_velocity, mixed_left_command, mixed_right_command);
             LeftWheel_speed = 0;
             RightWheek_speed = 0;
             return;
@@ -132,12 +156,12 @@ namespace ecucomm
         }
 
         ROS_INFO_THROTTLE(1.0,
-                          "cmd_vel: linear.x=%.3f m/s, angular.z=%.3f rad/s, wheel_separation=%.3f m | "
+                          "%s: linear.x=%.3f m/s, angular.z=%.3f rad/s, wheel_separation=%.3f m | "
                           "wheel_velocity: left=%.3f m/s, right=%.3f m/s | "
                           "raw_command: left=%.1f, right=%.1f | "
                           "mixed_command: left=%.1f, right=%.1f | "
                           "final_command: left=%.1f, right=%.1f, limited=%s",
-                          linear_velocity, angular_velocity, wheel_separation_,
+                          source, linear_velocity, angular_velocity, wheel_separation_,
                           leftv, rightv, left_command, right_command,
                           mixed_left_command, mixed_right_command, LeftWheel_speed, RightWheek_speed,
                           peak_command > max_motor_command ? "yes" : "no");
@@ -145,7 +169,8 @@ namespace ecucomm
 
     void ecucomm::joyCb(const sensor_msgs::Joy::ConstPtr &msg)
     {
-        if (static_cast<std::size_t>(estop_button_) >= msg->buttons.size() ||
+        if (msg->buttons.size() < 2 ||
+            static_cast<std::size_t>(estop_button_) >= msg->buttons.size() ||
             static_cast<std::size_t>(reset_button_) >= msg->buttons.size())
         {
             // 按键数据不完整时锁定发送，避免越界或错误解锁。
@@ -154,6 +179,7 @@ namespace ecucomm
             LeftWheel_speed = 0;
             RightWheek_speed = 0;
             joy_received_ = false;
+            joy_active_ = false;
             reset_button_was_pressed_ = false;
             ROS_WARN_THROTTLE(1.0,
                               "Joy has only %zu buttons; estop=%d, reset=%d. Serial transmission locked.",
@@ -163,10 +189,16 @@ namespace ecucomm
 
         const bool estop_pressed = msg->buttons[estop_button_] != 0;
         const bool reset_pressed = msg->buttons[reset_button_] != 0;
-        // 首条有效消息只记录重置键状态，避免把初始按住状态误判为新的按键动作。
+        const bool auto_pressed = msg->buttons[0] != 0;
+        const bool manual_pressed = msg->buttons[1] != 0;
+        // 首条有效消息只记录按键状态，避免把初始按住状态误判为新的按键动作。
         const bool reset_pressed_edge = joy_received_ && reset_pressed && !reset_button_was_pressed_;
+        const bool auto_pressed_edge = joy_received_ && auto_pressed && !auto_button_was_pressed_;
+        const bool manual_pressed_edge = joy_received_ && manual_pressed && !manual_button_was_pressed_;
         joy_received_ = true;
         reset_button_was_pressed_ = reset_pressed;
+        auto_button_was_pressed_ = auto_pressed;
+        manual_button_was_pressed_ = manual_pressed;
 
         // 急停优先；两键同时按下，或一直按住重置键，都不能解除急停。
         if (estop_pressed)
@@ -176,21 +208,72 @@ namespace ecucomm
                 ROS_WARN("Joystick estop pressed; serial transmission locked.");
             }
             emergency_stop_ = true;
+            has_cmd_vel_ = false;
+            joy_active_ = false;
+            LeftWheel_speed = 0;
+            RightWheek_speed = 0;
+            return;
         }
         else if (reset_pressed_edge)
         {
             emergency_stop_ = false;
-            ROS_INFO("Joystick reset pressed; serial unlocked, waiting for a new cmd_vel.");
+            manual_mode_ = true;
+            has_cmd_vel_ = false;
+            joy_active_ = false;
+            LeftWheel_speed = 0;
+            RightWheek_speed = 0;
+            ROS_INFO("Joystick reset pressed; unlocked in MANUAL mode, waiting for joystick input.");
+            return;
         }
-        else
+        if (emergency_stop_)
         {
             return;
         }
 
-        // 急停和重置均清空旧指令；重置后需收到后续 cmd_vel 才恢复发送。
-        has_cmd_vel_ = false;
-        LeftWheel_speed = 0;
-        RightWheek_speed = 0;
+        // 急停、解锁优先于模式切换；两种模式键同时按下时手动优先。
+        if (manual_pressed_edge || auto_pressed_edge)
+        {
+            manual_mode_ = manual_pressed;
+            has_cmd_vel_ = false;
+            joy_active_ = false;
+            LeftWheel_speed = 0;
+            RightWheek_speed = 0;
+            ROS_INFO("Control mode: %s; waiting for a new %s input.",
+                     manual_mode_ ? "MANUAL" : "AUTO", manual_mode_ ? "joystick" : "cmd_vel");
+            return;
+        }
+        if (!manual_mode_)
+        {
+            return;
+        }
+
+        if (msg->axes.size() < 2 ||
+            !std::isfinite(msg->axes[0]) || !std::isfinite(msg->axes[1]))
+        {
+            emergency_stop_ = true;
+            has_cmd_vel_ = false;
+            joy_active_ = false;
+            LeftWheel_speed = 0;
+            RightWheek_speed = 0;
+            ROS_WARN_THROTTLE(1.0, "Invalid joystick axes; serial transmission locked.");
+            return;
+        }
+
+        // axes[0] 左右，axes[1] 前后；正负方向使用相同的死区及线性映射。
+        const double angular_velocity = mapJoyAxis(msg->axes[0]);
+        const double linear_velocity = mapJoyAxis(msg->axes[1]);
+        ROS_INFO_THROTTLE(1.0,
+                          "Joy axes: turn=%.3f, forward=%.3f | mapped: angular=%.3f, linear=%.3f.",
+                          msg->axes[0], msg->axes[1], angular_velocity, linear_velocity);
+
+        // 初始回中状态不发送；开始操控后回中则发送零速度。
+        if (!joy_active_ && linear_velocity == 0.0 && angular_velocity == 0.0)
+        {
+            return;
+        }
+        joy_active_ = true;
+        // 与 cmd_vel 使用相同的转向方向校正，避免差速换算中重复取反。
+        setVelocity(linear_velocity, -angular_velocity, "joy");
     }
 
     // 发送消息
